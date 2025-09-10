@@ -77,3 +77,22 @@ variable "db_password" {
   type      = string
   sensitive = true
 }
+
+variable "client_port" {
+  type        = number
+  default     = 30000
+  description = "Minetest UDP port for clients"
+}
+
+variable "health_check_port" {
+  type        = number
+  default     = 30001
+  description = "TCP port used only for NLB health check"
+}
+
+# 単一のEC2用サブネット（空なら自動選択）
+variable "subnet_id" {
+  type        = string
+  default     = ""
+  description = "EC2 を配置する優先サブネットID。空なら effective_subnet_ids[0] を使用。"
+}

@@ -12,12 +12,10 @@ provider "aws" {
   region = var.aws_region
 }
 
-# --------------------------------
-# VPC / Subnets: 柔軟性を残すため
-# - var.vpc_id が空なら default VPC を自動検出
-# - var.subnet_ids が空なら default VPC のすべてのサブネットを自動検出
-# - var.ec2_subnet_id が空なら、上の自動検出結果の先頭を利用
-# --------------------------------
+# ---------------------------
+# デフォルトVPC/サブネットの自動検出
+# （明示指定があればそちらを優先）
+# ---------------------------
 data "aws_vpc" "default" {
   default = true
 }
@@ -29,143 +27,47 @@ data "aws_subnets" "default" {
   }
 }
 
-# 任意の VPC/Subnet を明示指定する場合に備え、by_id 参照も用意
-data "aws_subnet" "by_id" {
-  for_each = toset(var.subnet_ids)
-  id       = each.value
+# 実際に使うVPCのCIDR（NLBヘルス用インバウンドに使う）
+# local.effective_vpc_id を元に再取得
+data "aws_vpc" "selected" {
+  id = local.effective_vpc_id
 }
 
 locals {
-  # 有効VPC
-  effective_vpc_id = (
-    length(var.vpc_id) > 0 ? var.vpc_id : data.aws_vpc.default.id
-  )
-
-  # 有効Subnets
-  effective_subnet_ids = (
-    length(var.subnet_ids) > 0
-    ? var.subnet_ids
-    : data.aws_subnets.default.ids
-  )
-
-  # EC2用サブネット
-  effective_ec2_subnet_id = (
-    length(var.ec2_subnet_id) > 0
-    ? var.ec2_subnet_id
-    : local.effective_subnet_ids[0]
-  )
-
   name = "${var.project_name}-${var.aws_region}"
 
-  # user_data に渡すテンプレート（DB_HOST へ統一）
-  user_data = templatefile("${path.module}/user_data.sh", {
-    DB_HOST    = aws_db_instance.mtworld.address
-    DB_USER    = var.db_user
-    DB_PASS    = var.db_password
-    DB_NAME    = var.db_name
-    PROJECT    = local.name
-    project    = local.name    # ← user_data.sh が小文字projectを参照してもOKに
+  effective_vpc_id        = var.vpc_id != "" ? var.vpc_id : data.aws_vpc.default.id
+  effective_subnet_ids    = length(var.subnet_ids) > 0 ? var.subnet_ids : data.aws_subnets.default.ids
+  effective_ec2_subnet_id = var.subnet_id != "" ? var.subnet_id : local.effective_subnet_ids[0]
+
+  # EC2ごとの user_data（Primary/Standby に渡し分け）
+  user_data_primary = templatefile("${path.module}/user_data.sh", {
+    DB_HOST     = aws_db_instance.mtworld.address
+    DB_USER     = var.db_user
+    DB_PASS     = var.db_password
+    DB_NAME     = var.db_name
+    PROJECT     = local.name
+    project     = local.name
+    HEALTH_PORT = var.health_check_port
+    IS_PRIMARY  = "true"
+  })
+
+  user_data_standby = templatefile("${path.module}/user_data.sh", {
+    DB_HOST     = aws_db_instance.mtworld.address
+    DB_USER     = var.db_user
+    DB_PASS     = var.db_password
+    DB_NAME     = var.db_name
+    PROJECT     = local.name
+    project     = local.name
+    HEALTH_PORT = var.health_check_port
+    IS_PRIMARY  = "false"
   })
 }
 
-# --------------------------
-# セキュリティグループ
-# --------------------------
-resource "aws_security_group" "minetest_ec2" {
-  name        = "${local.name}-ec2-sg"
-  description = "Allow SSH and Minetest"
-  vpc_id      = local.effective_vpc_id
-
-  # SSH
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  # Minetest (Luanti) UDP 30000
-  ingress {
-    from_port   = 30000
-    to_port     = 30000
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  # どこへでも egress 可（RDS への接続もこれでOK）
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  tags = { Name = "${local.name}-ec2-sg" }
-}
-
-resource "aws_security_group" "minetest_rds" {
-  name        = "${local.name}-rds-sg"
-  description = "Allow Postgres from EC2 SG"
-  vpc_id      = local.effective_vpc_id
-
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.minetest_ec2.id] # ← タイポ修正済み
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  tags = { Name = "${local.name}-rds-sg" }
-}
-
-# タイポ修正用のローカル参照（既存名を壊さない）
-locals {
-  minesetest_ec2_sg_id = aws_security_group.minetest_ec2.id
-}
-# 上の RDS SG ingress 用に参照を修正
-
-# --------------------------
-# RDS Subnet Group & RDS
-# --------------------------
-resource "aws_db_subnet_group" "this" {
-  name       = "${local.name}-rds-subnets"
-  subnet_ids = local.effective_subnet_ids
-
-  tags = { Name = "${local.name}-rds-subnets" }
-}
-
-resource "aws_db_instance" "mtworld" {
-  identifier             = "${var.project_name}-pg"
-  db_name                = var.db_name
-  engine                 = "postgres"
-  engine_version         = "15.7"
-  instance_class         = var.rds_instance_class
-  allocated_storage      = var.rds_allocated_storage
-  username               = var.db_user
-  password               = var.db_password
-  db_subnet_group_name   = aws_db_subnet_group.this.name
-  vpc_security_group_ids = [aws_security_group.minetest_rds.id]
-  publicly_accessible    = true
-  skip_final_snapshot    = true
-
-  tags = { Name = "${local.name}-rds" }
-}
-
-# --------------------------
-# EC2 (Ubuntu 22.04 ARM64) + user_data
-# --------------------------
-data "aws_ami" "ubuntu" {
+# ---------------------------
+# AMI: Ubuntu 22.04 (Jammy) ARM64
+# ---------------------------
+data "aws_ami" "ubuntu_arm64" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
 
@@ -173,15 +75,217 @@ data "aws_ami" "ubuntu" {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
   }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
 }
 
-resource "aws_instance" "minetest" {
-  ami                    = data.aws_ami.ubuntu.id
+# ---------------------------
+# セキュリティグループ
+# ---------------------------
+
+# EC2側（SSH / Minetest-UDP / NLBヘルスTCP）
+resource "aws_security_group" "minetest_ec2" {
+  name        = "${local.name}-ec2-sg"
+  description = "Security group for Minetest EC2 instances"
+  vpc_id      = local.effective_vpc_id
+
+  # SSH
+  ingress {
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = [var.ssh_cidr]
+    ipv6_cidr_blocks = []
+    description      = "SSH"
+  }
+
+  # Minetest クライアント (UDP/30000)
+  ingress {
+    from_port        = var.client_port
+    to_port          = var.client_port
+    protocol         = "udp"
+    cidr_blocks      = [var.minetest_client_cidr]
+    ipv6_cidr_blocks = []
+    description      = "Minetest client UDP"
+  }
+
+  # NLB ヘルスチェック (TCP/30001) - VPC内から到達
+  ingress {
+    from_port        = var.health_check_port
+    to_port          = var.health_check_port
+    protocol         = "tcp"
+    cidr_blocks      = [data.aws_vpc.selected.cidr_block]
+    ipv6_cidr_blocks = []
+    description      = "NLB health check TCP"
+  }
+
+  # 全てのアウトバウンドを許可（OS/apt/DB接続など）
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = {
+    Name = "${local.name}-ec2-sg"
+  }
+}
+
+# RDS側（EC2のSGからのみ受け付け）
+resource "aws_security_group" "minetest_rds" {
+  name        = "${local.name}-rds-sg"
+  description = "Security group for Minetest RDS"
+  vpc_id      = local.effective_vpc_id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.minetest_ec2.id]
+    description     = "Allow Postgres from EC2 SG only"
+  }
+
+  tags = {
+    Name = "${local.name}-rds-sg"
+  }
+}
+
+# ---------------------------
+# RDS（PostgreSQL）
+# ---------------------------
+
+resource "aws_db_subnet_group" "this" {
+  name       = "${local.name}-db-subnet"
+  subnet_ids = local.effective_subnet_ids
+}
+
+resource "aws_db_instance" "mtworld" {
+  identifier           = "${local.name}-rds"
+  engine               = "postgres"
+  engine_version       = "15.7"
+  instance_class       = var.rds_instance_class
+  allocated_storage    = var.rds_allocated_storage
+  db_subnet_group_name = aws_db_subnet_group.this.name
+
+  db_name  = var.db_name
+  username = var.db_user
+  password = var.db_password
+
+  vpc_security_group_ids = [aws_security_group.minetest_rds.id]
+  publicly_accessible    = false # 非公開推奨
+  multi_az               = false # 教材向け簡易
+
+  skip_final_snapshot = true
+
+  deletion_protection = false
+
+  tags = {
+    Name = "${local.name}-rds"
+  }
+}
+
+# ---------------------------
+# EC2（2台：Primary / Standby）
+# ---------------------------
+
+resource "aws_instance" "minetest_1" {
+  ami                    = data.aws_ami.ubuntu_arm64.id
   instance_type          = var.instance_type
   subnet_id              = local.effective_ec2_subnet_id
   vpc_security_group_ids = [aws_security_group.minetest_ec2.id]
   key_name               = var.key_name
-  user_data              = local.user_data
 
-  tags = { Name = "${local.name}-ec2" }
+  user_data = local.user_data_primary
+
+  tags = {
+    Name = "${local.name}-ec2-1"
+    Role = "primary"
+  }
+}
+
+# 2台目は別AZへ（例として別サブネットを選択）
+resource "aws_instance" "minetest_2" {
+  ami                    = data.aws_ami.ubuntu_arm64.id
+  instance_type          = var.instance_type
+  subnet_id              = length(local.effective_subnet_ids) > 1 ? local.effective_subnet_ids[1] : local.effective_ec2_subnet_id
+  vpc_security_group_ids = [aws_security_group.minetest_ec2.id]
+  key_name               = var.key_name
+
+  user_data = local.user_data_standby
+
+  tags = {
+    Name = "${local.name}-ec2-2"
+    Role = "standby"
+  }
+}
+
+# ---------------------------
+# NLB（UDP 30000 / ヘルスチェック TCP 30001）
+# ---------------------------
+
+resource "aws_lb" "minetest_nlb" {
+  name                             = "${local.name}-nlb"
+  load_balancer_type               = "network"
+  subnets                          = local.effective_subnet_ids
+  enable_cross_zone_load_balancing = true
+  ip_address_type                  = "ipv4"
+
+  tags = {
+    Name = "${local.name}-nlb"
+  }
+}
+
+resource "aws_lb_target_group" "minetest_udp_tg" {
+  name        = "${local.name}-udp-tg"
+  port        = var.client_port
+  protocol    = "UDP"
+  vpc_id      = local.effective_vpc_id
+  target_type = "instance"
+
+  health_check {
+    protocol = "TCP" # UDPはヘルス不可、TCPでチェック
+    port     = var.health_check_port
+  }
+
+  tags = {
+    Name = "${local.name}-udp-tg"
+  }
+}
+
+resource "aws_lb_listener" "minetest_udp_listener" {
+  load_balancer_arn = aws_lb.minetest_nlb.arn
+  port              = var.client_port
+  protocol          = "UDP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.minetest_udp_tg.arn
+  }
+}
+
+# 2台をターゲットグループに登録
+resource "aws_lb_target_group_attachment" "tg_attach_1" {
+  target_group_arn = aws_lb_target_group.minetest_udp_tg.arn
+  target_id        = aws_instance.minetest_1.id
+  port             = var.client_port
+}
+
+resource "aws_lb_target_group_attachment" "tg_attach_2" {
+  target_group_arn = aws_lb_target_group.minetest_udp_tg.arn
+  target_id        = aws_instance.minetest_2.id
+  port             = var.client_port
+}
+
+# ---------------------------
+# 出力
+# ---------------------------
+# これで上書きしてください（description から変数参照を排除）
+output "nlb_dns_name" {
+  value       = aws_lb.minetest_nlb.dns_name
+  description = "Use this DNS name for Minetest clients."
 }

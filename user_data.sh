@@ -111,3 +111,35 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now minetest
+
+# === (追記) NLBヘルスチェック用のTCPエンドポイント ===
+apt-get update -y
+apt-get install -y socat
+
+cat >/etc/systemd/system/minetest-health.service <<'EOF'
+[Unit]
+Description=Minetest NLB TCP health endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/minetest/env
+ExecStart=/usr/bin/socat TCP-LISTEN:${HEALTH_PORT},fork,reuseaddr SYSTEM:"/bin/echo OK"
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+install -d -m 0755 /etc/minetest
+cat >/etc/minetest/env <<EOF
+HEALTH_PORT=${HEALTH_PORT}
+EOF
+
+# Primaryだけヘルスサービスを起動（Standbyは起動しない＝常時OutOfService）
+if [ "${IS_PRIMARY}" = "true" ]; then
+  systemctl daemon-reload
+  systemctl enable --now minetest-health.service
+fi
