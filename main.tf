@@ -13,8 +13,7 @@ provider "aws" {
 }
 
 # ---------------------------
-# デフォルトVPC/サブネットの自動検出
-# （明示指定があればそちらを優先）
+# デフォルトVPC/サブネットの自動検出（明示指定があればそちらを優先）
 # ---------------------------
 data "aws_vpc" "default" {
   default = true
@@ -102,7 +101,7 @@ resource "aws_security_group" "minetest_ec2" {
     description      = "SSH"
   }
 
-  # Minetest クライアント (UDP/30000)
+  # Minetest クライアント (UDP/30000 デフォルト)
   ingress {
     from_port        = var.client_port
     to_port          = var.client_port
@@ -181,12 +180,50 @@ resource "aws_db_instance" "mtworld" {
   multi_az               = false # 教材向け簡易
 
   skip_final_snapshot = true
-
   deletion_protection = false
 
   tags = {
     Name = "${local.name}-rds"
   }
+}
+
+# ---------------------------
+# 監視のための IAM（CloudWatch Agent / SSM）
+# ---------------------------
+
+data "aws_iam_policy_document" "ec2_trust" {
+  statement {
+    sid     = "EC2AssumeRole"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ec2_role" {
+  name               = "${local.name}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
+}
+
+# CloudWatch Agent 権限
+resource "aws_iam_role_policy_attachment" "cw_agent" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# （任意）SSMで踏み台レス管理を有効化
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "${local.name}-ec2-profile"
+  role = aws_iam_role.ec2_role.name
 }
 
 # ---------------------------
@@ -200,7 +237,8 @@ resource "aws_instance" "minetest_1" {
   vpc_security_group_ids = [aws_security_group.minetest_ec2.id]
   key_name               = var.key_name
 
-  user_data = local.user_data_primary
+  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+  user_data            = local.user_data_primary
 
   tags = {
     Name = "${local.name}-ec2-1"
@@ -216,7 +254,8 @@ resource "aws_instance" "minetest_2" {
   vpc_security_group_ids = [aws_security_group.minetest_ec2.id]
   key_name               = var.key_name
 
-  user_data = local.user_data_standby
+  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+  user_data            = local.user_data_standby
 
   tags = {
     Name = "${local.name}-ec2-2"
@@ -282,9 +321,72 @@ resource "aws_lb_target_group_attachment" "tg_attach_2" {
 }
 
 # ---------------------------
+# 通知（SNS） + 代表的なCloudWatchアラーム
+# ---------------------------
+
+resource "aws_sns_topic" "ops_alerts" {
+  name = "${local.name}-ops-alerts"
+}
+
+# ※ メール通知したい場合は以下を有効化し、受信メールで購読承認してください
+# resource "aws_sns_topic_subscription" "ops_email" {
+#   topic_arn = aws_sns_topic.ops_alerts.arn
+#   protocol  = "email"
+#   endpoint  = "YOUR_MAIL@example.com"
+# }
+
+# 1) luantiserver プロセスが 0 件（CloudWatch Agentのprocstat）
+resource "aws_cloudwatch_metric_alarm" "luanti_down" {
+  alarm_name          = "${local.name}-luantiserver-down"
+  namespace           = "CWAgent"
+  metric_name         = "procstat_lookup_pid_count"
+  dimensions          = { pattern = "luantiserver" }
+  statistic           = "Average"
+  period              = 60
+  evaluation_periods  = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  alarm_description   = "luantiserver process is not running"
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+  ok_actions          = [aws_sns_topic.ops_alerts.arn]
+}
+
+# 2) NLB HealthyHostCount < 1
+resource "aws_cloudwatch_metric_alarm" "nlb_no_healthy" {
+  alarm_name          = "${local.name}-nlb-no-healthy"
+  namespace           = "AWS/NetworkELB"
+  metric_name         = "HealthyHostCount"
+  statistic           = "Average"
+  period              = 60
+  evaluation_periods  = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  dimensions = {
+    LoadBalancer = aws_lb.minetest_nlb.arn_suffix
+    TargetGroup  = aws_lb_target_group.minetest_udp_tg.arn_suffix
+  }
+  alarm_actions = [aws_sns_topic.ops_alerts.arn]
+  ok_actions    = [aws_sns_topic.ops_alerts.arn]
+}
+
+# 3) RDS 空きストレージが 5GiB 未満
+resource "aws_cloudwatch_metric_alarm" "rds_free_storage_low" {
+  alarm_name          = "${local.name}-rds-free-storage-low"
+  namespace           = "AWS/RDS"
+  metric_name         = "FreeStorageSpace"
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 5 * 1024 * 1024 * 1024
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.mtworld.id }
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+  ok_actions          = [aws_sns_topic.ops_alerts.arn]
+}
+
+# ---------------------------
 # 出力
 # ---------------------------
-# これで上書きしてください（description から変数参照を排除）
 output "nlb_dns_name" {
   value       = aws_lb.minetest_nlb.dns_name
   description = "Use this DNS name for Minetest clients."

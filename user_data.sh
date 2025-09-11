@@ -143,3 +143,44 @@ if [ "${IS_PRIMARY}" = "true" ]; then
   systemctl daemon-reload
   systemctl enable --now minetest-health.service
 fi
+
+# === CloudWatch Agent: install & config ===
+curl -fsSL -o /tmp/amazon-cloudwatch-agent.deb \
+  https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/arm64/latest/amazon-cloudwatch-agent.deb
+dpkg -i /tmp/amazon-cloudwatch-agent.deb || true
+
+install -d -m 0755 /opt/aws/amazon-cloudwatch-agent/etc
+
+# ※ ${PROJECT} を展開したいのでクォート無しのヒアドキュメントを使用
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<JSON
+{
+  "agent": {
+    "metrics_collection_interval": 30,
+    "logfile": "/var/log/amazon-cloudwatch-agent.log"
+  },
+  "metrics": {
+    "metrics_collected": {
+      "cpu": { "resources": ["*"], "total": true, "measurement": ["cpu_usage_user","cpu_usage_system","cpu_usage_idle"] },
+      "mem": { "measurement": ["mem_used_percent"] },
+      "disk": { "resources": ["*"], "measurement": ["used_percent"], "drop_device": true },
+      "procstat": [
+        { "pattern": "luantiserver", "measurement": ["pid_count"] }
+      ]
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          { "file_path": "/var/lib/minetest/world/debug.txt", "log_group_name": "minetest/${PROJECT}/world", "log_stream_name": "{instance_id}", "retention_in_days": 14 },
+          { "file_path": "/var/log/syslog", "log_group_name": "minetest/${PROJECT}/syslog", "log_stream_name": "{instance_id}", "retention_in_days": 14 }
+        ]
+      }
+    }
+  }
+}
+JSON
+
+systemctl enable amazon-cloudwatch-agent
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
